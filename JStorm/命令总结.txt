@@ -1,0 +1,20 @@
+查看进程的环境变量： cat  .proc.pid.environ|tr '\0' '\n'
+grep -v keyword   打印没有这个keyword的行
+
+eclipse 寻找文件:shift + ctrl + r
+
+grep -rn "10-196-130-242" *
+
+iptables -t 表名 <-A/I/D/R> 规则链名 [规则号] <-i/o 网卡名> -p 协议名 <-s 源IP/源子网> --sport 源端口 <-d 目标IP/目标子网> --dport 目标端口 -j 动作
+
+来自: http://man.linuxde.net/iptables
+
+sudo iptables -L  查看防火墙
+
+sudo iptables -A INPUT -d localhost -p tcp --sport 2182 -j DROP 
+
+sudo iptables -F   恢复链接
+
+lsof -i:$PORT"查看应用该端口的程序
+
+

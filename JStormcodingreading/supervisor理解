@@ -1,0 +1,22 @@
+SynchronizeSupervisorEvent：获取需要开启的任务，清理无效任务的数据
+1. 读取Assignment快照，获取stormId与Assignment的映射关系，从zookeeper中../assignments目录根据stormId创建
+2. 读取stormId与storm code存放路径的映射关系
+3. 获取已有stormId，存放在$STORM_HOME/$STORM_LOCAL_DIR/supervisor/stormdist
+4. 获取已有LocalAssignments，存放在$STORM_HOME/$STORM_LOCAL_DIR/supervisor/localstate
+5. 根据1获取的Assigenment快照计算需要新开启的Assignment（根据supervisorId匹配获取），存入localState
+6. 为没下载代码的的stormId下载代码到对应的路径
+
+SyncProcessesEvent：干掉无效的worker，启动新worker
+1. 从localState中获取需要开启的Assignments
+2. 过滤已经合法启动有端口映射的Assignments
+3. 干掉无效的worker
+4. 根据Assignments启动worker
+
+SupervisorHeartbeat：
+1. 上传SupervisorInfo信息到zookeeper
+
+UpdateBlobsforAllTopologiesFnCallBack：
+1. 定时更新stormId对应的blob数据
+
+HealthCheckRunnableCallback： 
+1. 检测$storm.home/healthchecks下的安全检测执行文件是否执行成功，有一个失败则认为有异常，关掉所有worker

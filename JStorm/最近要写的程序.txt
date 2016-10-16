@@ -1,0 +1,1 @@
+1.完成一个简单的通过thrift和zookeeper通信的程序。

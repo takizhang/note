@@ -1,0 +1,84 @@
+## AckerBolt的实现及原理
+# Acker创建
+1 acker的个数，默认为worker的个数(默认为1) -> 也就是AckerBolt的paramhint并发数
+2 acker的关键参数
+    2.1 acker的input：三种[都是fieldGroup的]：
+        2.1.1 spouts GlobalStreamID(compId, "__ack_init")->fieldGroup[id]
+        2.1.2 bolts GlobalStreamID(compId, "__ack_ack")->fieldGroup[id]和 GlobalStreamID(compId, "__ack_fail")->fieldGroup[id]
+    2.2 acker的output[即stream]：两个 "__ack_ack"->"id" 和 "__ack_fail"->"id" ===> 为了发送给 spout
+    2.3 TICK周期为 MSG TIMEOUT(30s)
+3 除了acker，topology的原有spout和bolt 也需要添加新的stream(spout还有input) 对应 ackerBolt的input(和acker的stream)
+    3.1 每个bolt 添加2个："__ack_ack"->"id, ack-val" 和 "__ack_fail"->"id"
+    3.2 每个spout 的 TICK周期改为 MSG TIMEOUT(30s) //TODO 为了触发timeout
+        3.2.1 spout添加新的stream："__ack_init" -> "id, init-val, spout-task"
+        3.2.2 spout添加新的input：GlobalStreamID("__acker", "__ack_ack") -> directGrouping
+        3.2.3 spout添加新的input：GlobalStreamID("__acker", "__ack_fail") -> directGrouping
+4 把 ackerBolt 放入到topology的 bolts中，acker创建完成
+# XOR
+按照tuple的流向，每经过一个bolttask，就会产生一组随机值，然后我们把随机值传递到下一组bolt，并且把这一组随机值用XOR的方式绑定到当前bolt的随机值上传给acker。
+如果全部ack成功，则每一个随机值都XOR了 2 次，最终结果为0；
+
+acker的原理：
+    acker bolt的execute 就是不断接收 spout的INIT和bolt的ACK|FAIL消息，判断spout的Tuple是不是正常执行结束了，然后将 这个判断(ACK|FAIL) 传递给spout，
+最终调用 spout的ack或者fail接口
+    spout每次发送一个tuple都要对应的发送一条ackerTuple[INIT]给acker，acker缓存并跟踪这个ackerTuple 
+    注意，acker只会跟踪 spout的tuple。而不管bolt中间生成的tuple，对于bolt，acker只负责接收其发送过来的 ACK[ack-val]和FAIL消息，收到FAIL消息我们简单的告诉
+spout fail就OK，收到ACK消息则需要updateAck(求bit-or(新值和acker缓存的值))，如果这个值变回初始值，则表示成功
+# ackertuple的结构：{tuple-id, ack-val, spout-task}。
+    1 tuple-id是ackerTuple的随机ID
+    2 ack-val 初始值(init-val)为0，后面我们要用这个值来计算，判断是否成功处理了spout的tuple
+    3 spout-task 即 发送这条tuple的spout的task的id(一个component可能多个task，我们要区分每一个spout task)
+# acker生效的2个先决条件：
+    1 topology.acker.executors为null或者>0， 
+    2 spoutcollector.emit(STREAMID, tuple, messageID) 设置messageID参数
+    这样的一个tuple 我们认为是 rootTuple，一个根tuple，acker只会跟踪root tuple。
+# ack-val的变化
+    在acker创建里面我们提到了acker-tuple 的"ack-val"，每一次spout|bolt发送tuple时，都会产生一个随机数和这个值进行XOR运算，而bolt向acker发送tuple时，也会
+带上一个(outAckVal^接收到的随机数) 的ack-val，acker每次接收到bolt的ack消息我们都要 bit-or，如果每一个bolt都成功ack则ack-val变回0，则表示spout的tuple处理成功！如果有一个bolt没有成功ack，则ack-val都不会变为0，spout就知道tuple是否成功执行。
+
+# 正常的ack流程
+1 spout.nextTuple => collector.emit => collector.sendSpoutMsg (主要有2个动作，1-生成tuple放到spout的pending中，2-生成ackerTuple..)//TODO 他们的发送不会影响么
+    1.1 注意collector.emit的接口参数(STREAMID, tuple, messageID)，如果messageID为null则消息不会用acker跟踪。
+    1.2 根据 tasksFn生成的outTasks，以及是否rootTuple的判断，生成tupleID
+        1.2.1 root? 生成long rootID作为总ID(他不指定具体的task，是ackertuple的id)，然后根据每一个 outTask生成一个具体的long id
+            1.2.1.1 根据指定task的id 生成 tupleID(rootid->id) = anchored锚定的tuple
+            1.2.1.2 根据上面的id生成 ackertuple的信息，参见{tuple-id, ack-val, spout-task}。实际值是 {rootid, ids的异或值, spouttask的id}
+        1.2.2 非root，不需要acker跟踪，所以我们也不需要知道他的上下游关系，他的tupleID没有rootid和id信息。Unanchored非锚定的tuple
+    1.3 AckerBolt收到 INIT消息 {rootid, ids的异或值, spouttaskid} -> 放入pending -> output
+    1.4 Bolt收到了spout的tuple，处理之后 ack -> 因为是一个锚定Tuple -> 发送 ACK 给AckerBolt
+        1.4.1 Bolt没有下家bolt （ack|fail）
+            1.4.1.1 ack {rootid, bolttaskid和ackval的异或值}，计算 ack-val = id(对应改bolttask的那个随机值) ^ ackval(outackVal:0) => acker
+            1.4.1.2 fail {rootid} => 告诉spout fail
+        1.4.2 Bolt有下家bolt （ack|fail|emit）
+            1.4.2.1 emit 他会修改bolttask当前的ack-val=X // TODO
+            1.4.2.2 ack {rootid, bolttaskid和ackval的异或值}，计算 ack-val = id(对应改bolttask的那个随机值) ^ ackval(outackVal:X) => acker
+            1.4.2.3 fail {rootid} => 告诉spout fail
+    1.5 AckerBolt 不断接收spouts|bolts 的ackertuple，并且更新本地缓存的ack-val(XOR) ，直到ack-val变为0，告诉spouts tuple成功。
+	
+	
+## 一个简单的acker示例
+一个spoutA 并发1 => 一个BoltA并发2(allGroup) 的例子
+SpoutA [taskid:1] - BoltA [taskid:2, taskid:3], allGroup
+
+1 spouttask[1]
+rootid 随机值为100
+ids随机值[128, 233]分别对应BoltA[2]和BoltA[3]    ==>   ack-val=128^233=105
+=> 发送tuple到BoltA[2] => {....... tupleid:{100->128}}
+=> 发送tuple到BoltA[3] => {....... tupleid:{100->233}}
+=> 发送ackerTuple到AckerBolt => INIT stream {100, 105, 1}  // ID, ACK-VAL, SPOUT-TASK-ID
+=> AckerBolt 缓存此tuple信息。
+2 bolttask[2]
+BoltA[2]
+调用ack接口 => tupleid{100, 128} => ack-val= 128 XOR 0 = 128 // 这里 outackVal: 0[默认值] ，outackVal未更新(bolt.emit时会更新)
+=> 发送ackerTuple到AckerBolt => ACK stream {100, 128}
+ackerBolt  {100 {105, 1}} ==updateAck=> ack-val = 105 XOR 128 = 233
+
+3 bolttask[3]
+BoltA[3]
+调用ack接口 => tupleid{100, 233} => ack-val= 233XOR 0 = 233
+==> 发送ackerTuple到AckerBolt => ACK stream {100, 233}
+ackerBolt  {100 {105, 1}} ==updateAck=> 233 XOR 233 => 0
+
+4 AckerBolt emit ACK to spouttask[1]
+5 spout.ack
+	

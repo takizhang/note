@@ -1,0 +1,175 @@
+StormTopology(spoutId->SpoutSpec, boltId->Bolt, spoutId->StateSpoutSpec, worker_hooks)
+StormSubmitter.submitTopologyAs->LocalCluster.submitTopologyWithOpts->ServiceHandler.submitTopologyWithOpts
+
+topology提交理解：
+
+总体逻辑：对提交的topology进行合法性校验，上传jar、conf等信息到zookeeper，
+          提交StormBase到zookeeper的../storms目录提供给NimbusServer读取分配给supervisor启动
+
+逻辑分解：
+1. 检查是否为leader
+2. 检查topologyName的合法性
+3. 权限检查
+4. 检查是否有同名topology在运行
+5. 检查配置文件
+6. DefaultTopologyValidator.validate（未实现的空方法）
+7. 生成stormId：=stormName+sumitCount.increment+currtimeSecs
+8. 计算并行度、设置json_conf(NimbusUtils.normalizeTopology)
+9. Common.systemTopology(此处不起作用，只是构造，但没返回)
+   9.1 validateBasic：合法性校验，不合法抛出异常
+       9.1.1 校验stream_id/component_id/spout_id/bolt_id是否合法，以__开头即不合法(即systemId)
+       9.1.2 校验SpoutSpec是否有input
+	   9.1.3 校验taskNum是否大于0，parallelismHint是否大于0
+   9.2 深复制SystemTopology
+   9.3 addAcker: 添加AckerBolt(component_id="__acker")
+       9.3.1 构造AckerBolt的输入：Spout.GlobalStreamId(spoutId, "__ack_init"), FiledGrouping("id") 
+	                              Bolt.GlobalStreamId(boltId, "__ack_ack", FiledGrouping("id")
+								  Bolt.GlobalStreamId(boltId, "__ack_fail", FiledGrouping("id")
+	   9.3.2 构造AckerBolt的输出：streamId="__ack_ack"/"__ack_fail" StreamInfo("id")
+       9.3.3 通过前面两点及配置信息构造AckerBolt
+	   9.3.4 遍历设置Bolt的输出：1.streamId="__ack_ack" outputFields("id", "ack-val") 2.streamId="__ack_fail" outputFields("id")
+	   9.3.5 设置Spout的输出：streamId="__ack_init" outputFields("id", "init-val", "spout-task")
+	         设置Spout的输入：GlobalStreamId("__acker", streamId="__ack_ack") DirectGrouping
+			                  GlobalStreamId("__acker", streamId="__ack_fail") DirectGrouping
+	   9.3.6 添加到SystemTopology的bolt集合中，boltId="__acker"
+   9.4 addMetricComponents：添加指标组件，未实现
+   9.5 addSystemComponents：添加系统组件
+       9.5.1 创建SystemBolt对象
+	   9.5.2 构造SystemBolt的输入：空
+	   9.5.3 构造SystemBolt的输出：1.streamId="__tick" StreamInfo("rate_secs") 2.streamId="__tick" StreamInfo("interval")
+	   9.5.4 添加到SystemTopology的bolt集合中，boltId="__system"
+   9.6 validateStructure：校验结构合法性
+       9.6.1 各个component的输入输出是否能对应上(输入组件不存在，输入组件的输出stream不匹配等)
+10. 校验Woker数、Executor数是否大于允许的配置值(NimbusUtils.validateTopologySize)
+11.	设置证书信息(stormClusterState.setCredentials)  
+12. 上传jar包信息、配置信息、topology序列化信息(stormjarKey/stormconfKey/stormcodeKey)
+13. 等待stormjarKey/stormconfKey/stormcodeKey在BlobStore复制份数已经达到配置值
+14. 在zookeeper设置topology的worker心跳上报存放路径：/workerbeats/{stormId}  stormClusterState.setupHeartbeats(stormId);
+15. 在zookeeper设置topology的worker压力上报存放路径：/backpressure/{stormId} stormClusterState.setupBackpressure(stormId);
+16. 通知topologyAction监听器（没起作用，初始化时没有配置对应的class）
+17. 设置topology的状态为启动状态
+18. 启动storm：NimbusUtils.startStorm
+    18.1 构造SystemTopology：创建AckerBolt SystemBolt等 详见9.描述(Common.systemTopology)
+    18.2 根据topology获取所有的component
+	18.3 计算每个component对应的Executor建立component->ExuecutorNum关系
+	18.4 构造StormBase(topologyName, topologyInitialStatus, topologyWorkers, component->ExuecutorNum, launchTimeSec=now, owner=user)
+	18.5 启动storm，即存储StormBase到zookeeper的../storms目录提供给NimbusServer读取启动
+	
+
+SchedulerAssignmentImpl(stormId, ExecutorDetails->WorkerSlot)
+Cluster(supervisorId->SupervisorDetails, topologyId->SchedulerAssignment, host->supervisorId)	
+
+ExeuctorDetails(startTask, endTask)
+ExecutorInfo(task_start, task_end) 
+NodeInfo(node=supervisorId, port)
+WorkerSlot(nodeId=supervisorId, port, memOnHeap, memOffHeap, cpu)
+Assignment(master_code_dir, nodeId->host, Executor->NodeInfo, Executor->start_time_secs, NodeInfo->WorkerResources)
+SupervisorInfo(time_secs, host_name, assignment_id, user_ports, meta, scheduler_meta, version, supervisor_conf, resources_map)
+SupervisorDetails(id, host, allPorts, meta, schedulerMeta, _total_resources)
+
+
+	
+StormSubmitter：计算组件的输出输入关系，构造StormBase存入zookeeper给Nimbus读取
+Nimbus: 资源分配，计算Executor->NodeInfo，构造Assignment存入zookeeper给Supervisor读取
+Supervisor: 从zookeeper读取自身SupervisorId关联的Assignment以port为纬度启动Worker
+Worker: 启动自身port关联的Executor
+Executor：启动SpoutExecutor/BoltExecutor线程
+SpoutExecutor/BoltExecutor：根据Executor的taskId个数并行执行多少个SpoutObject/BoltObject
+
+Nimbus如何知道有多少个Supervisor？
+Supervisor启动会在zookeeper中创建zookeeper目录，Nimbus从zookeeper读取可知道有多少zookeeper.
+
+NImbus如何知道每个Supervisor有多少个端口？
+Supervisor启动时会读取配置数据Config.SUPERVISOR_SLOTS_PORTS的值。
+
+Nimbus的Executor分配过程：
+
+
+
+
+* 概要说明
+
+```
+StormSubmitter：计算组件的输出输入关系，构造StormBase存入zookeeper给Nimbus读取
+Nimbus: 资源分配，计算Executor->NodeInfo，构造Assignment存入zookeeper给Supervisor读取
+Supervisor: 从zookeeper读取自身SupervisorId关联的Assignment以port为纬度启动Worker
+Worker: 启动自身port关联的Executor
+Executor：启动SpoutExecutor/BoltExecutor线程
+SpoutExecutor/BoltExecutor：根据Executor的taskId个数并行执行多少个SpoutObject/BoltObject
+```
+
+* Worker：
+
+```
+被Supervisor发起用于执行Executor的进程执行实体
+一个Worker只能执行同一个Topology的一个或多个Executor
+主要职能：
+1. 根据Topology的组件输入输出关系，与上下游的Worker建立网络连接
+2. 根据port启动关联的Executor
+3. 接收上游Worker发送的数据，传递给对应的Executor使用
+4. 消费Worker传输队列的数据(由内部Executor产生)，传送给下游对应的Worker
+5. 上传Worker心跳信息给Nimbus/Supervisor
+```
+* Executor
+
+```
+被Worker发起用于执行SpoutExecutor/BoltExecutor的线程执行单元
+一个Executor只能执行同一个Topology的一个SpoutExecutor或BoltExecutor
+一个SpoutExecutor/BoltExecutor能执行同一SpoutObject/BoltObject对象的一个或多个实例
+主要职能：
+1. 启动数据队列转换监听线程，消费SpoutObject/BoltObject产生的数据写入到Worker传输队列
+2. 启动SpoutExecutor/BoltExecutor线程
+
+SpoutExecutor
+被Executor发起用于执行SpoutObject的线程执行单元
+主要职能：
+1. 初始化时执行SpoutObject.open，资源预置准备工作
+2. 定时不间断执行SpoutObject.nextTuple，进行发射元组及Acker操作
+
+BoltExecutor
+被Executor发起用于执行BoltObject的线程执行单元
+主要职能：
+1. 初始化执行BoltObject.prepare，资源预置准备工作
+2. 定时不间断执行BoltObject.execute，接收元组处理及Acker操作
+```
+* Task
+
+```
+SpoutObject/BoltObject的并行粒度单元，Executor有多少个Task就有多少个并行粒度的SpoutObject/BoltObject
+```
+* Component
+
+```
+用于描述Spout/Bolt的抽象单元
+如：Bolt有BusinessBolt AckerBolt SystemBolt，都是Bolt Component
+```
+* AckerBolt
+
+```
+用于判断Spout发送的元组是否有被成功流转处理
+简单示例：
+1. Spout: 发送Tuple: Tuple.rootId=10 Tuple.ackVal=0 Tuple.MessageId.ackVal=12 streamId="STRAEM_ID_WORD"
+          发送AckerTuple: AckerTuple.ackVal=12 streamId="__ack_init" 
+2. AckerBolt: 接收AckerTuple: AckObject.val=AckObject.val^AckerTuple.ackVal=0^12=12	
+3. Bolt 1: emit -> Bolt 2: 
+                接收Tuple(from spout): Tuple.ackVal^edgeId(随机数生成，假如为22)=0^22=22 
+				发送新创建的Tuple: Tuple.ackVal=0 Tuple.MessageId.ackVal=22 streamId="STRAEM_ID_WORD"
+           ack -> AckerBolt: 
+		        接收Tuple(from spout，Tuple.MessageId.ackVal在emit中被修改): Tuple.ackVal^Tuple.MessageId.ackVal=12^22=26
+				发送AckerTuple: AckerTuple.ackVal=26 streamId="__ack_ack" 
+4. AckerBolt: AckObject.val=AckerTuple.ackVal^AckObject.val=26^12=22
+5. Bolt 2: ack -> AckerBolt: 
+           接收Tuple(from Bolt 1:emit): Tuple.ackVal^Tuple.MessageId.ackVal= 0^22=22 
+		   发送AckerTuple: AckerTuple.ackVal=22 streamId="__ack_ack"
+6. AckerBolt: AckObject.val=AckerTuple.ackVal^AckObject.val=22^22=0
+              AckObject.val=0，那么发送通知给Spout
+7. Spout.ack
+```
+
+
+
+
+
+	
+	   
+	   

@@ -1,0 +1,131 @@
+NimbusServer：启动NimbusServer，监听客户端提交的Assignment数据，计算分配Assignment分配到各个supervisor
+1. 初始化NimbusData：1.1. 初始化MkStormClusterState：创建zookeeper的以下目录：ASSIGNMENTS_SUBTREE
+                          /STORMS_SUBTREE/SUPERVISORS_SUBTREE/WORKERBEATS_SUBTREE/ERRORS_SUBTREE
+					      /BLOBSTORE_SUBTREE/USER_SUBTREE/NIMBUSES_SUBTREE/LOGCONFIG_SUBTREE
+					 1.2 初始化ZkLeaderElector、BlobStore等
+					 1.3 初始化起始时间
+					 1.4 初始化其它成员变量
+2. 设置nimbus的ip端口概要信息
+3. 把当前节点添加到leader候选队列--//TODO
+4. 在zookeeper中清除原有topology信息: Assignment、StormBase、Blobstore等
+5. 如果blobstore为LocalFsBlobStore（blobstore初始化根据配置信息决定），那么注册blobstore的回调函数BlobSyncRunnableCallback用于同步blobstore信息
+6. 如果当前节点为leader节点，那么传输启动状态给topology(事实上没起作用)
+7. 启动定时执行的MonitorRunnable：创建对应的Assignment到zookeeper目录提供给Supervisor获取启动worker
+                 CleanInboxRunnable：定时清理$storm.home/nimbus/inbox中的数据
+				 BlobSyncRunnableCallback：blobstore的同步上传下载
+				 CleanTopologyHistoryRunnableCallback：
+				 RenewCredentialsrRunnableCallBack：同步证书信息
+
+TopologyStatus:以下四种状态有作用，其它没起作用。KILLED/ACTIVE/INACTIVATE/REBALANCING
+NimbusUtils.allSchedulingSlots方法的topologies/missingAssignmentTopologies参数并没有作用，在调用inimbus.allSlotsAvailableForScheduling时也没起作用，反而会误导人
+
+				 
+线程功能描述：
+MonitorRunnable->NimbusUtils.mkAssignments：
+主要功能：读取提交数据建立ExcutorInfo->NodeInfo的映射关系，创建对应的Assignment到zookeeper目录提供给Supervisor获取启动worker
+
+详细解读：//TODO 需要完善
+1. 判断当前节点是否为leader节点，答案为否则退出
+2. 从zookeeper中读取../storms目录下的文件夹名称，即活跃的topologyId集合
+3. 根据topologyId集合获取TopologyDetails数据：
+   3.1 获取topologyConf信息(topologyId-stormconf.ser)
+   3.2 获取StormTopology信息(topologyId-stormcode.ser)
+   3.3 计算ExecutorInfo->Component的映射关系
+       3.3.1 计算ExecutorInfo信息(NimbusUtils.computeExecutors)
+	         3.3.1.1 从stormBase中获取component->exuecutorId的映射关系
+			 3.3.1.2 计算taskId->component的映射关系(Common.stormTaskInfo)，一个或多个taskId对应一个componentId
+			 3.3.1.3 根据component->taskIds component->executors计算出每个executor->taskIds，从而创建ExecutorInfo(task_start, task_end)
+	   3.3.2 获取taskId->component的映射关系(Common.stormTaskInfo)
+	   3.3.3 根据前面两点计算出ExecutorInfo->component的映射关系
+   3.4 设置ExeuctorDetails->component的映射关系
+   3.5 构造TopologyDetails返回
+4. 读取所有的../assignments目录下的所有子目录名称(即assignmentId)
+5. 根据4的返回数据从zookeeper目录中获取existingAssignments(即已经存在的Assignment)
+6. 计算需要新启动的topology->SchedulerAssignment映射关系集合(NimbusUtils.computeNewSchedulerAssignments)
+   6.1 计算topology->executors的映射关系：获取一个topologyId对应的ExecutorInfo
+   6.2 更新executors的心跳信息
+   6.3 计算topology->alive-executors的映射关系(启动不超时、当前运行不超时)
+   6.4 计算supervisor(nodeId)->dead-ports的映射关系，通过topology->executors剔除topology->alive-executors可得
+   6.5 计算topology->SchedulerAssignment的映射关系 //TODO
+   6.6 计算missing-assignment-topologies //TODO
+   6.7 计算all-scheduling-slots：为missingAssignmentTopologies创建WorkerSlot，返回NodeInfo集合
+   6.8 获取所有的supervisor
+   6.9 构造Cluster：supervisors和6.5的数据
+   6.10 schedule： topologies cluster
+7. 计算topology->(ExecutorDetail->NodeInfo)的映射关系
+8. 计算topology->(NodeInfo->WorkerResources)的映射关系  
+9. 创建Assignment，返回topology->Assignment的映射关系
+10. 存储9返回的Assignment到zookeeper的../assignments目录
+11. inimbus.assignSlots空方法，没实际作用
+
+
+重要对象结构：以下结构有助于理解里面各种互相转换的逻辑
+ExeuctorDetails(startTask, endTask)
+ExecutorInfo(task_start, task_end) 
+NodeInfo(node=supervisorId, port)
+WorkerSlot(nodeId=supervisorId, port, memOnHeap, memOffHeap, cpu)
+Assignment(master_code_dir, nodeId->host, Executor->NodeInfo, Executor->start_time_secs, NodeInfo->WorkerResources)
+SupervisorInfo(time_secs, host_name, assignment_id, user_ports, meta, scheduler_meta, version, supervisor_conf, resources_map)
+SupervisorDetails(id, host, allPorts, meta, schedulerMeta, _total_resources)
+SchedulerAssignmentImpl(stormId, ExecutorDetails->WorkerSlot)
+Cluster(supervisorId->SupervisorDetails, topologyId->SchedulerAssignment, host->supervisorId)
+
+
+
+MonitorRunnable线程功能
+主要功能：
+1. 再分配：对../assignments已经存在的Assignment重新计算分配WorkerSlot更新到zookeeper目录，提供给Supervisor获取启动worker
+2. 创建：对../storms新创建的topology分配WorkerSlot增加到zookeeper目录，提供给Supervisor获取启动worker
+
+详细分解：
+一、Topologies topologies: 从zookeeper中读取../storms目录下的文件夹名称，即活跃的topologyId集合，构造TopologyDetails
+
+二、stormId对应的List<ExeuctorInfo>：由stormId对应的stormBase中获取component->executor
+                                     由stormId从zookeeper中获取SystemTopology得出taskId->component 
+								     由前面两点得出executor->List<taskId>，从而创建ExeuctorInfo(task_start, task_end)
+三、Map<String, Assignment> existingAssignments：zookeeper的../assignments目录读取，即所有topologyId对应的assignment
+
+四、topologyId->newSchedulerAssignments：（此处通过分解分析，但还没理解到整体的意思）
+  1. topology->Executor集合：为每一个topologyId获取对应的List<ExecutorInfo>
+  2. 更新所有的Executor的心跳
+  3. topology->aliveExecutor集合：过滤topology->Executor中启动不超时、当前运行不超时的Executor
+  4. supervisor->dead-ports集合：topology->Executor剔除topology->aliveExecutor那么得出死掉的Executor，再通过Assignment获取出死掉Executor对应的NodeInfo.getPort
+  5. topology->scheduler-assignment集合：遍历existingAssignments，为既存在于Assignment.Executor->NodeInfo又存在于topology->aliveExecutor的Executor创建SchedulerAssignmentImpl
+  6. missingAssignmentTopologies：没有Assignment的topology，没起作用的变量
+  7. allSchedulingSlotsList(List<NodeInfo>)：从zookeeper中获取所有的id->SupervisorInfo，计算出nodeId->port的映射关系(一个node对应n个port)，构造NodeInfo返回
+  8. supervisors(id->SupervisorDetails)：从zookeeper中获取所有的id->SupervisorInfo，移除supervisor->dead-ports的端口，合并allSchedulingSlotsList的端口，构造SupervisorDetails返回
+  9. 构造Cluster：通过supervisors topology->scheduler-assignment构造
+  10. cluster.getScheduler().schedule(topologies, cluster)--用的是AbsoluteScheduler
+      10.1 对topologies排序，根据名字进行排序
+	  10.2 遍历topologies，为Topology的Executor分配WorkerSlot
+		   
+五、topologyToExecutorToNodeport: 通过解析topologyId->newSchedulerAssignments返回
+
+六、newAssignedWorkerToResources(topology->(NodeInfo->WorkerResources))：遍历topologyId->newSchedulerAssignments计算返回
+
+七、newAssignments：遍历topologyToExecutorToNodeport在创建Assignment
+
+八、根据第七点返回的Assignment存放到../assignments目录，供各个supervisor读取启动worker:
+      1. 遍历newAssignments，被第三点existingAssignments包含->Assignment发生了变化->重新覆盖
+	                         被第三点existingAssignments包含->Assignment没有发生变化->输出日志
+							 被第三点existingAssignments包含->直接写入
+
+先跳过仍需继续精读的逻辑：
+NimbusUtils.computeNewSchedulerAssignments							 
+AbsoluteScheduler.schedule
+
+DefaultScheduler.schedule逻辑
+     10.1 遍历topologies，获取List<TopologyDetails> needsSchedulingTopologies：
+	       判断条件：topology规划的worker数量大于第五点计算分配的woker数量
+	                 或topology提交的worker数小于实际分配的worker数
+      10.2 遍历needsSchedulingTopologies：
+	       10.2.1 List<WorkerSlot> availableSlots：通过SupervisorDetails.allPorts剔除topology->scheduler-assignment的port构造WorkerSlot返回
+		   10.2.2 Set<ExecutorDetails> allExecutors：获取TopologyDetails的所有ExecutorDetail
+		   10.2.3 Map<WorkerSlot, List<ExecutorDetails>> aliveAssigned： 通过SchedulerAssignmentImpl获取WorkerSlot->List<ExecutorDetails>
+		   10.2.4 Set<ExecutorDetails> aliveExecutors：aliveAssigned.keySet()
+		   10.2.4 Set<WorkerSlot> canReassignSlots: SupervisorDetails.allPorts包含aliveAssigned.WorkerSlot.port的WrokerSlot
+		   10.2.5 int totalSlotsToUse
+		   10.2.6 Set<WorkerSlot> badSlot
+		   10.2.7 cluster.freeSlots(badSlot)
+		   10.2.8 EvenScheduler.scheduleTopologiesEvenly：为topology分配创建Assignment，建立ExeuctorDetails与WorkerSlot的关系（即Executor对应到supervisor的端口）
+
